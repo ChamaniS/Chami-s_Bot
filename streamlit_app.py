@@ -1,182 +1,302 @@
 import os
 import certifi
 
-# Force Python to use a valid CA bundle.
 os.environ["SSL_CERT_FILE"] = certifi.where()
-
-# Clear common env vars that can point to broken cert paths.
 os.environ.pop("REQUESTS_CA_BUNDLE", None)
 os.environ.pop("CURL_CA_BUNDLE", None)
 
+from dotenv import load_dotenv
+import streamlit as st
 from google import genai
 from google.genai import types
-import streamlit as st
-from dotenv import load_dotenv
-from datetime import datetime
-import traceback
 
-# =========================================================
-# LOAD ENV FILE  (CRITICAL FIX)
-# =========================================================
+import json
+from datetime import datetime
+from pathlib import Path
+
+
+# ----------------------------
+# Setup
+# ----------------------------
 load_dotenv()
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-st.set_page_config(page_title="Chami's Bot", page_icon="🤖", layout="wide")
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "chat_data"
+DATA_DIR.mkdir(exist_ok=True)
 
-# =========================================================
-# STATE INIT
-# =========================================================
+CHAT_SAVE_PATH = DATA_DIR / "conversation.json"
+
+st.set_page_config(
+    page_title="Chami's Bot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+DEFAULT_SYSTEM_PROMPT = """
+You are a helpful assistant.
+Answer clearly and naturally.
+Use short paragraphs and bullet points when helpful.
+If the user asks for steps, give step-by-step instructions.
+Do not answer in one tiny sentence unless the question is tiny.
+""".strip()
+
+
+# ----------------------------
+# State
+# ----------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
-# =========================================================
-# CONFIG FROM ENV
-# =========================================================
-API_KEY = os.getenv("GEMINI_API_KEY")
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+if "model" not in st.session_state:
+    st.session_state.model = DEFAULT_MODEL
 
-# =========================================================
-# LOGGING
-# =========================================================
-def log(msg, level="INFO"):
+if "temperature" not in st.session_state:
+    st.session_state.temperature = 0.7
+
+if "max_output_tokens" not in st.session_state:
+    st.session_state.max_output_tokens = 1200
+
+if "system_prompt" not in st.session_state:
+    st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def log(message: str, level: str = "INFO") -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
-    line = f"{timestamp} | {level} | {msg}"
+    line = f"{timestamp} | {level} | {message}"
     st.session_state.logs.append(line)
     st.session_state.logs = st.session_state.logs[-200:]
     print(line)
 
 
-# =========================================================
-# GEMINI CALL
-# =========================================================
-def ask_gemini(prompt, model):
+def save_chat() -> None:
+    payload = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "model": st.session_state.model,
+        "messages": st.session_state.messages,
+    }
+    CHAT_SAVE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def export_chat_text() -> str:
+    lines = []
+    for msg in st.session_state.messages:
+        role = msg["role"].capitalize()
+        content = msg["content"]
+        lines.append(f"{role}: {content}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def build_prompt(user_prompt: str) -> str:
+    history = st.session_state.messages[-8:]
+
+    convo_lines = [st.session_state.system_prompt, ""]
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        convo_lines.append(f"{role}: {msg['content']}")
+
+    convo_lines.append(f"User: {user_prompt}")
+    convo_lines.append("Assistant:")
+
+    return "\n".join(convo_lines)
+
+
+def ask_gemini(prompt: str) -> str:
+    if not API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing. Put it in your .env file.")
+
     client = genai.Client(api_key=API_KEY)
 
-    full_prompt = f"""
-You are a helpful assistant.
-Give a detailed answer.
-Use clear headings and bullet points when appropriate.
-Do not answer in only one sentence.
-
-User question:
-{prompt}
-"""
-
     config = types.GenerateContentConfig(
-        temperature=0.7,
-        max_output_tokens=1500,
+        temperature=st.session_state.temperature,
+        max_output_tokens=int(st.session_state.max_output_tokens),
     )
 
     response = client.models.generate_content(
-        model=model,
-        contents=full_prompt,
+        model=st.session_state.model,
+        contents=prompt,
         config=config,
     )
 
-    return getattr(response, "text", str(response))
+    text = getattr(response, "text", None)
+    return text if text else str(response)
 
 
-# =========================================================
-# FALLBACK HANDLER
-# =========================================================
-def generate_with_fallback(prompt, model):
-    models = [model, "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+def ask_gemini_with_fallback(user_prompt: str) -> tuple[str, str]:
+    candidates = [
+        st.session_state.model,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
 
-    for m in models:
+    seen = []
+    for model in candidates:
+        if model in seen:
+            continue
+        seen.append(model)
+
         try:
-            log(f"Trying model: {m}")
-            reply = ask_gemini(prompt, m)
-            return reply, m
+            st.session_state.model = model
+            prompt = build_prompt(user_prompt)
+            log(f"Trying model: {model}")
+            reply = ask_gemini(prompt)
+            return reply, model
         except Exception as e:
             err = str(e).lower()
-            log(f"{m} failed: {e}", "ERROR")
+            log(f"Model failed: {model} -> {e}", "ERROR")
 
-            if not any(k in err for k in ["429", "quota", "resource_exhausted"]):
+            quota_like = any(
+                key in err for key in ["429", "quota", "resource_exhausted", "rate limit"]
+            )
+
+            if not quota_like:
                 raise
 
-    raise RuntimeError("All models failed")
+    raise RuntimeError("All model attempts failed.")
 
 
-# =========================================================
-# SIDEBAR
-# =========================================================
+def quick_prompt(text: str) -> None:
+    st.session_state.messages.append({"role": "user", "content": text})
+    log(f"User: {text}")
+
+    try:
+        with st.spinner("Thinking..."):
+            reply, used_model = ask_gemini_with_fallback(text)
+
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        log(f"Reply generated using {used_model}")
+        save_chat()
+
+    except Exception as e:
+        error_text = f"Error: {e}"
+        st.session_state.messages.append({"role": "assistant", "content": error_text})
+        log(error_text, "ERROR")
+        save_chat()
+
+
+# ----------------------------
+# Sidebar
+# ----------------------------
 st.sidebar.title("Settings")
-
 st.sidebar.write("API key loaded:", "✅ Yes" if API_KEY else "❌ No")
+st.sidebar.write("Working folder:", str(APP_DIR))
 
-model = st.sidebar.text_input("Model", DEFAULT_MODEL)
+st.session_state.model = st.sidebar.text_input(
+    "Model",
+    value=st.session_state.model,
+    help="Try gemini-2.5-flash first. It is more reliable for demos.",
+)
 
-if st.sidebar.button("Clear Chat"):
+st.session_state.temperature = st.sidebar.slider(
+    "Temperature",
+    min_value=0.0,
+    max_value=2.0,
+    value=float(st.session_state.temperature),
+    step=0.1,
+)
+
+st.session_state.max_output_tokens = st.sidebar.slider(
+    "Max output tokens",
+    min_value=128,
+    max_value=4096,
+    value=int(st.session_state.max_output_tokens),
+    step=128,
+)
+
+st.session_state.system_prompt = st.sidebar.text_area(
+    "System prompt",
+    value=st.session_state.system_prompt,
+    height=180,
+)
+
+if st.sidebar.button("Clear chat"):
     st.session_state.messages = []
+    save_chat()
     st.rerun()
 
-if st.sidebar.button("Clear Logs"):
+if st.sidebar.button("Clear logs"):
     st.session_state.logs = []
     st.rerun()
 
-# =========================================================
-# MAIN UI
-# =========================================================
+chat_export = export_chat_text()
+st.sidebar.download_button(
+    "Download chat as text",
+    data=chat_export,
+    file_name="chat_history.txt",
+    mime="text/plain",
+)
+
+if CHAT_SAVE_PATH.exists():
+    st.sidebar.caption(f"Saved chat file: {CHAT_SAVE_PATH.name}")
+
+
+# ----------------------------
+# Main UI
+# ----------------------------
 st.title("Chami's Bot")
-st.caption("Simple browser UI with logs")
+st.caption("Simple browser demo with chat, logs, and quick actions.")
 
-col1, col2 = st.columns([2, 1])
+col_chat, col_logs = st.columns([2.2, 1])
 
-# ---------------- CHAT ----------------
-with col1:
+with col_chat:
+    st.subheader("Quick actions")
+
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        if st.button("Summarize this"):
+            quick_prompt("Summarize this in simple bullet points.")
+            st.rerun()
+    with q2:
+        if st.button("Explain step by step"):
+            quick_prompt("Explain this step by step.")
+            st.rerun()
+    with q3:
+        if st.button("Rewrite shorter"):
+            quick_prompt("Rewrite the last response in a shorter, clearer way.")
+            st.rerun()
+
+    st.divider()
+
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    prompt = st.chat_input("Type your message...")
+    user_input = st.chat_input("Type your message...")
 
-    if prompt:
-        if not API_KEY:
-            st.error("GEMINI_API_KEY is missing. Check your .env file.")
-            st.stop()
-
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        log(f"User: {prompt}")
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        log(f"User: {user_input}")
 
         try:
             with st.spinner("Thinking..."):
-                reply, used_model = generate_with_fallback(prompt, model)
+                reply, used_model = ask_gemini_with_fallback(user_input)
 
-            st.session_state.messages.append(
-                {"role": "assistant", "content": reply}
-            )
+            st.session_state.messages.append({"role": "assistant", "content": reply})
             log(f"Reply generated using {used_model}")
+            save_chat()
+            st.rerun()
 
         except Exception as e:
-            error_msg = f"Error: {e}"
-            log(error_msg, "ERROR")
+            error_text = f"Error: {e}"
+            st.session_state.messages.append({"role": "assistant", "content": error_text})
+            log(error_text, "ERROR")
+            save_chat()
+            st.rerun()
 
-            st.session_state.messages.append(
-                {"role": "assistant", "content": error_msg}
-            )
-
-            # full traceback in UI
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "```text\n"
-                    + traceback.format_exc()
-                    + "\n```",
-                }
-            )
-
-        st.rerun()
-
-# ---------------- LOG PANEL ----------------
-with col2:
+with col_logs:
     st.subheader("Logs")
-    logs = "\n".join(st.session_state.logs) or "No logs yet"
-    st.text_area("Log output", logs, height=500)
+    log_output = "\n".join(st.session_state.logs) if st.session_state.logs else "No logs yet."
+    st.text_area("Log output", value=log_output, height=420)
 
     st.subheader("Status")
     st.write(f"Messages: {len(st.session_state.messages)}")
+    st.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
